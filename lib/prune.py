@@ -7,7 +7,7 @@ from .layerwrapper import WrappedGPT
 from .data import get_loaders 
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from transformers import AdamW
+from torch.optim import AdamW
 import numpy as np
 import matplotlib.pyplot as plt
 import gc
@@ -114,9 +114,16 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
     model.config.use_cache = False
     layers = model.model.layers
 
-    # dev = model.hf_device_map["model.embed_tokens"]
-    if "model.embed_tokens" in model.hf_device_map:
-        device = model.hf_device_map["model.embed_tokens"]
+    # Ensure inputs are moved to the same device as the model's parameters
+    if isinstance(model.hf_device_map, dict) and len(model.hf_device_map) > 0:
+        if "model.embed_tokens" in model.hf_device_map:
+            device = model.hf_device_map["model.embed_tokens"]
+        else:
+            # fallback: pick the first device used in the device map
+            device = list(model.hf_device_map.values())[0]
+    # Convert to torch.device if necessary
+    if isinstance(device, str):
+        device = torch.device(device)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
@@ -147,6 +154,15 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
     model.config.use_cache = use_cache
 
     return inps, outs, attention_mask, position_ids 
+
+def _get_layer_output(layer, inputs, attention_mask, position_ids, rotary_emb):
+    """Helper function to get layer output, handling position_embeddings for new models."""
+    hidden_states = inputs.unsqueeze(0)
+    # Manually compute position embeddings using the model's rotary_emb
+    cos, sin = rotary_emb(hidden_states, position_ids=position_ids)
+    position_embeddings = (cos, sin)
+    # Pass the computed embeddings to the layer
+    return layer(hidden_states, attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     thres_cumsum = sum_before * alpha 
@@ -321,8 +337,10 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
 
-    layers = model.model.layers
+    # The rotary embedding layer is part of the model, not the individual layers
+    rotary_emb = model.model.rotary_emb
 
+    layers = model.model.layers
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -345,7 +363,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name))) ## this is a important function.
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = _get_layer_output(layer, inps[j], attention_mask, position_ids, rotary_emb)
 
         for h in handles:
             h.remove() 
@@ -393,7 +411,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = _get_layer_output(layer, inps[j], attention_mask, position_ids, rotary_emb)
+        
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
@@ -404,51 +423,22 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=-1):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
-
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
-
-    if "model.embed_tokens" in model.hf_device_map:
-        dev = model.hf_device_map["model.embed_tokens"]
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    dataloader, _ = get_loaders(
+        "c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, dev)
+    
+    rotary_emb = model.model.rotary_emb
 
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-    layers[0] = Catcher(layers[0])
-    for batch in dataloader:
-        try:
-            model(batch[0].to(dev))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-
-    print('Ready.')
+    layers = model.model.layers
+    if layer_no != -1:
+        layers = layers[layer_no:layer_no+1]
 
     for i in range(len(layers)):
         layer = layers[i]
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
-            print(f"layer {i} device {dev}")
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
         subset = find_layers(layer)
@@ -467,24 +457,17 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            with torch.no_grad():
+                outs[j] = _get_layer_output(layer, inps[j], attention_mask, position_ids, rotary_emb)
         for h in handles:
             h.remove()
 
         for name in gpts:
             print(i, name)
-            print('Pruning ...')
-
-            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+            gpts[name].fasterprune(
+                args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128
+            )
             gpts[name].free()
 
-        for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-
-        layers[i] = layer 
-        torch.cuda.empty_cache()
-
-        inps, outs = outs, inps
-
-    model.config.use_cache = use_cache
-    torch.cuda.empty_cache()
+    model.config.use_cache = True 
+    print('Done.')

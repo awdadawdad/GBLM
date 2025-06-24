@@ -25,12 +25,13 @@ def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
     return ppl 
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
+@torch.no_grad()
 def eval_ppl_wikitext(model, testenc, bs=1, device=None):
-    # Get input IDs
+    # Get model's device directly to avoid device mismatch
+    device = next(model.parameters()).device
+    seqlen = model.seqlen
     testenc = testenc.input_ids
-
-    # Calculate number of samples
-    nsamples = testenc.numel() // model.seqlen
+    nsamples = testenc.numel() // seqlen
 
     # List to store negative log likelihoods
     nlls = []
@@ -45,28 +46,25 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         j = min(i+bs, nsamples)
 
         # Prepare inputs and move to device
-        inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
-        inputs = inputs.reshape(j-i, model.seqlen)
-
-        # Forward pass through the model
+        batch_size = min(bs, nsamples - i)
+        
+        inputs = testenc[:, (i * seqlen):((i + batch_size) * seqlen)].to(device)
         lm_logits = model(inputs).logits
-
-        # Shift logits and labels for next token prediction
         shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = inputs[:, 1:]
+        shift_labels = testenc[:, (i * seqlen + 1):((i + batch_size) * seqlen + 1)][:,:shift_logits.shape[1]].to(device)
 
         # Compute loss
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
         # Calculate negative log likelihood
-        neg_log_likelihood = loss.float() * model.seqlen * (j-i)
+        neg_log_likelihood = loss.float() * seqlen * (j-i)
 
         # Append to list of negative log likelihoods
         nlls.append(neg_log_likelihood)
 
     # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))
 
     # Empty CUDA cache to save memory
     torch.cuda.empty_cache()

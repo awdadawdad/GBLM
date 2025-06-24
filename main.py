@@ -2,7 +2,8 @@ import argparse
 import os 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, check_sparsity, find_layers, prune_gradient, prune_gblm
@@ -37,7 +38,7 @@ def main():
     parser.add_argument('--seq_length', type=int, default=2048, help='Sequence length of the input.')
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
     parser.add_argument('--layer_no', type=int, default=-1, help='Sparsity level')
-    parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
+    parser.add_argument("--sparsity_type", default="unstructured", type=str, help="Sparsity pattern: unstructured, or n:m e.g. 2:4")
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt","gradient", "gblm"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
@@ -60,10 +61,10 @@ def main():
         prune_n, prune_m = map(int, args.sparsity_type.split(":"))
 
     model_name = args.model.split("/")[-1]
-    print(f"loading llm model {args.model}")
+    print("loading llm model", args.model)
     model = get_llm(args.model, args.cache_dir)
     model.eval()
-    tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     device = torch.device("cuda:0")
     if "30b" in args.model or "65b" in args.model or "70b" in args.model: 
