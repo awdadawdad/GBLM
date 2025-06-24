@@ -39,13 +39,16 @@ def main():
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
     parser.add_argument('--layer_no', type=int, default=-1, help='Sparsity level')
     parser.add_argument("--sparsity_type", default="unstructured", type=str, help="Sparsity pattern: unstructured, or n:m e.g. 2:4")
-    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt","gradient", "gblm"])
+    parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", "gradient", "gblm", "wanda_pp"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument('--grad_exponent', action='store_true', help='Use gradient of exponent')
     parser.add_argument('--gradient_inv', action='store_true', help='Use inverse of gradient')
+    # Args for Wanda++
+    parser.add_argument('--alpha', type=float, default=0.5, help='Alpha value for Wanda++ RGS score.')
+    parser.add_argument('--k_rounds', type=int, default=5, help='Number of RO rounds for Wanda++.')
     args = parser.parse_args()
     print(f"Working on model: {args.model}")
     print(f"working on method {args.prune_method}, grad norm {args.grad_norm}, gradient path {args.gradient_path}, inverse enabled {args.gradient_inv}, sparsity type {args.sparsity_type}, seq lenght {args.seq_length}")
@@ -79,6 +82,11 @@ def main():
             prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "gblm":
             prune_gblm(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
+        elif args.prune_method == "wanda_pp":
+            # Placeholder for wanda_pp call
+            print("Wanda++ pruning is selected but not yet implemented in this script.")
+            # from lib.prune import prune_wanda_pp
+            # prune_wanda_pp(args, model, tokenizer, device, layer_no=idx)
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "gradient":
