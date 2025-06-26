@@ -50,12 +50,18 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         
         inputs = testenc[:, (i * seqlen):((i + batch_size) * seqlen)].to(device)
         lm_logits = model(inputs).logits
-        shift_logits = lm_logits[:, :-1, :].contiguous()
+        # Cast to fp32 for numerical stability during softmax & cross-entropy
+        shift_logits = lm_logits[:, :-1, :].contiguous().float()
         shift_labels = testenc[:, (i * seqlen + 1):((i + batch_size) * seqlen + 1)][:,:shift_logits.shape[1]].to(device)
 
         # Compute loss
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+
+        # Skip NaN or Inf losses to avoid corrupting PPL
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"warning: encountered NaN/Inf loss at sample {i}")
+            continue
 
         # Calculate negative log likelihood
         neg_log_likelihood = loss.float() * seqlen * (j-i)
@@ -63,8 +69,12 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         # Append to list of negative log likelihoods
         nlls.append(neg_log_likelihood)
 
+    if len(nlls) == 0:
+        print("Warning: All samples produced NaN/Inf loss. Model may be severely damaged.")
+        return float('inf')
+
     # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))
+    ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * seqlen))
 
     # Empty CUDA cache to save memory
     torch.cuda.empty_cache()

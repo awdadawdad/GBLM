@@ -6,7 +6,7 @@ import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 
-from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, check_sparsity, find_layers, prune_gradient, prune_gblm
+from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, check_sparsity, find_layers, prune_gradient, prune_gblm, wanda_pp
 from lib.eval import eval_ppl
 
 print('torch', version('torch'))
@@ -20,7 +20,7 @@ def get_llm(model, cache_dir="llm_weights"):
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
-        device_map="auto"
+        device_map="cuda:0"
     )
     print("printing gpu allocation for all the layers")
     print(model.hf_device_map)
@@ -33,8 +33,8 @@ def main():
     parser.add_argument('--model', type=str, help='LLaMA model')
     parser.add_argument('--gradient_path', default=None,type=str, help='gradient path')
     parser.add_argument('--grad_norm', type=str, default="none", choices=["none", "accumulation_norm", "2-norm-sample-dim"])
-    parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
-    parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
+    parser.add_argument('--seed', type=int, default=0, help='Seed for sampling.')
+    parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration data samples.')
     parser.add_argument('--seq_length', type=int, default=2048, help='Sequence length of the input.')
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
     parser.add_argument('--layer_no', type=int, default=-1, help='Sparsity level')
@@ -45,10 +45,14 @@ def main():
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument('--grad_exponent', action='store_true', help='Use gradient of exponent')
-    parser.add_argument('--gradient_inv', action='store_true', help='Use inverse of gradient')
-    # Args for Wanda++
-    parser.add_argument('--alpha', type=float, default=0.5, help='Alpha value for Wanda++ RGS score.')
-    parser.add_argument('--k_rounds', type=int, default=5, help='Number of RO rounds for Wanda++.')
+    parser.add_argument('--gradient_inv', action="store_true", help="Whether to inverse the gradient.")
+
+    # Arguments for Wanda++
+    parser.add_argument('--alpha', type=float, default=0.5, help='Alpha for RGS score in Wanda++.')
+    parser.add_argument('--k_rounds', type=int, default=5, help='Number of regional optimization rounds in Wanda++.')
+    parser.add_argument('--ro_samples', type=int, default=2, help='Number of samples for regional optimization in Wanda++.')
+    parser.add_argument('--lr', type=float, default=3e-7, help='Learning rate for regional optimization in Wanda++.')
+
     args = parser.parse_args()
     print(f"Working on model: {args.model}")
     print(f"working on method {args.prune_method}, grad norm {args.grad_norm}, gradient path {args.gradient_path}, inverse enabled {args.gradient_inv}, sparsity type {args.sparsity_type}, seq lenght {args.seq_length}")
@@ -83,10 +87,7 @@ def main():
         elif args.prune_method == "gblm":
             prune_gblm(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "wanda_pp":
-            # Placeholder for wanda_pp call
-            print("Wanda++ pruning is selected but not yet implemented in this script.")
-            # from lib.prune import prune_wanda_pp
-            # prune_wanda_pp(args, model, tokenizer, device, layer_no=idx)
+            wanda_pp(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "gradient":

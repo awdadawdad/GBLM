@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import gc
 import csv
 import os
+from copy import deepcopy
+import random
 
 from pdb import set_trace as st 
 
@@ -114,16 +116,8 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
     model.config.use_cache = False
     layers = model.model.layers
 
-    # Ensure inputs are moved to the same device as the model's parameters
-    if isinstance(model.hf_device_map, dict) and len(model.hf_device_map) > 0:
-        if "model.embed_tokens" in model.hf_device_map:
-            device = model.hf_device_map["model.embed_tokens"]
-        else:
-            # fallback: pick the first device used in the device map
-            device = list(model.hf_device_map.values())[0]
-    # Convert to torch.device if necessary
-    if isinstance(device, str):
-        device = torch.device(device)
+    # 强制使用传入的 device（cuda:0），忽略 hf_device_map
+    device = torch.device("cuda:0")
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
@@ -156,13 +150,15 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
     return inps, outs, attention_mask, position_ids 
 
 def _get_layer_output(layer, inputs, attention_mask, position_ids, rotary_emb):
-    """Helper function to get layer output, handling position_embeddings for new models."""
+    """Helper function to get layer output that gracefully handles missing masks/ids."""
     hidden_states = inputs.unsqueeze(0)
-    # Manually compute position embeddings using the model's rotary_emb
-    cos, sin = rotary_emb(hidden_states, position_ids=position_ids)
-    position_embeddings = (cos, sin)
-    # Pass the computed embeddings to the layer
-    return layer(hidden_states, attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
+
+    if (position_ids is not None) and (rotary_emb is not None):
+        cos, sin = rotary_emb(hidden_states, position_ids=position_ids)
+        position_embeddings = (cos, sin)
+        return layer(hidden_states, attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
+    else:
+        return layer(hidden_states, attention_mask=attention_mask)[0]
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     thres_cumsum = sum_before * alpha 
@@ -236,7 +232,7 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
         gradients = torch.load(args.gradient_path, map_location=torch.device('cpu')) 
 
     print("loading calibdation data")
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
+    dataloader, testenc = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
@@ -246,9 +242,14 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+        # 强制所有操作在 cuda:0 上进行
+        dev = torch.device("cuda:0")
+        # 将 inps/outs 转移到目标设备
+        inps = inps.to(dev)
+        outs = outs.to(dev)
+        # attention_mask 或 position_ids 可能为 None，需要判空后再转移到设备
+        att_mask_dev = attention_mask.to(dev) if attention_mask is not None else None
+        pos_ids_dev = position_ids.to(dev) if position_ids is not None else None
 
         wrapped_layers = {}
         for name in subset:
@@ -264,7 +265,7 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
             handles.append(subset[name].register_forward_hook(add_batch(name))) ## this is a important function.
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_mask_dev, position_ids=pos_ids_dev)[0]
 
         for h in handles:
             h.remove() 
@@ -316,11 +317,11 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].weight.data.masked_fill_(W_mask, 0.0)
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=att_mask_dev, position_ids=pos_ids_dev)[0]
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache 
@@ -332,7 +333,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     model.config.use_cache = False 
 
     print("loading calibdation data")
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
+    dataloader, testenc = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
@@ -345,13 +346,19 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+        # 强制所有操作在 cuda:0 上进行
+        dev = torch.device("cuda:0")
+        # 将 inps/outs 转移到目标设备
+        inps = inps.to(dev)
+        outs = outs.to(dev)
+        # attention_mask 或 position_ids 可能为 None，需要判空后再转移到设备
+        att_mask_dev = attention_mask.to(dev) if attention_mask is not None else None
+        pos_ids_dev = position_ids.to(dev) if position_ids is not None else None
 
         wrapped_layers = {}
         for name in subset:
             wrapped_layers[name] = WrappedGPT(subset[name], layer_id=i, layer_name=name)
+            print(wrapped_layers[name])
 
         def add_batch(name):
             def tmp(_, inp, out):
@@ -363,7 +370,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name))) ## this is a important function.
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = _get_layer_output(layer, inps[j], attention_mask, position_ids, rotary_emb)
+                outs[j] = _get_layer_output(layer, inps[j], att_mask_dev, pos_ids_dev, rotary_emb)
 
         for h in handles:
             h.remove() 
@@ -407,11 +414,11 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+            subset[name].weight.data.masked_fill_(W_mask, 0.0)
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = _get_layer_output(layer, inps[j], attention_mask, position_ids, rotary_emb)
+                outs[j] = _get_layer_output(layer, inps[j], att_mask_dev, pos_ids_dev, rotary_emb)
         
         inps, outs = outs, inps
 
@@ -423,7 +430,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=-1):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders(
+    dataloader, testenc = get_loaders(
         "c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer
     )
     with torch.no_grad():
@@ -437,9 +444,14 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
 
     for i in range(len(layers)):
         layer = layers[i]
-        if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+        # 强制所有操作在 cuda:0 上进行
+        dev = torch.device("cuda:0")
+        # 将 inps/outs 转移到目标设备
+        inps = inps.to(dev)
+        outs = outs.to(dev)
+        # attention_mask 或 position_ids 可能为 None，需要判空后再转移到设备
+        att_mask_dev = attention_mask.to(dev) if attention_mask is not None else None
+        pos_ids_dev = position_ids.to(dev) if position_ids is not None else None
 
         subset = find_layers(layer)
 
@@ -458,7 +470,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = _get_layer_output(layer, inps[j], attention_mask, position_ids, rotary_emb)
+                outs[j] = _get_layer_output(layer, inps[j], att_mask_dev, pos_ids_dev, rotary_emb)
         for h in handles:
             h.remove()
 
@@ -471,3 +483,166 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
 
     model.config.use_cache = True 
     print('Done.')
+
+def wanda_pp(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, layer_no=-1):
+    use_cache = model.config.use_cache 
+    model.config.use_cache = False 
+
+    print("loading calibdation data for Wanda++")
+    dataloader, testenc = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
+    print("dataset loading complete")
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
+
+    rotary_emb = model.model.rotary_emb
+    layers = model.model.layers
+
+    # Hyperparameters for Wanda++ are now taken from args
+    WANDA_PP_ALPHA = args.alpha
+    WANDA_PP_K = args.k_rounds
+    WANDA_PP_RO_SAMPLES = args.ro_samples
+    WANDA_PP_LR = args.lr
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        # 强制所有操作在 cuda:0 上进行
+        dev = torch.device("cuda:0")
+        # 将 inps/outs 转移到目标设备
+        inps = inps.to(dev)
+        outs = outs.to(dev)
+        # attention_mask 或 position_ids 可能为 None，需要判空后再转移到设备
+        att_mask_dev = attention_mask.to(dev) if attention_mask is not None else None
+        pos_ids_dev = position_ids.to(dev) if position_ids is not None else None
+
+        def compute_rgs_score(current_layer):
+            activation_cache = {name: [] for name in subset}
+            def get_hook(name):
+                def hook(_, inp, out):
+                    activation_cache[name].append(inp[0].detach())
+                return hook
+            
+            handles = []
+            for name, mod in current_layer.named_modules():
+                if name in subset:
+                    handles.append(mod.register_forward_hook(get_hook(name)))
+            
+            for j in range(args.nsamples):
+                with torch.no_grad():
+                    _get_layer_output(current_layer, inps[j].to(dev), att_mask_dev, pos_ids_dev, rotary_emb)
+            for h in handles:
+                h.remove()
+
+            sq_grad = {name: torch.zeros_like(p.weight) for name, p in subset.items()}
+            for j in range(args.nsamples):
+                output = _get_layer_output(current_layer, inps[j].to(dev), att_mask_dev, pos_ids_dev, rotary_emb)
+                loss = torch.norm(output)
+                loss.backward()
+
+                with torch.no_grad():
+                    for name, p in subset.items():
+                        if p.weight.grad is not None:
+                            sq_grad[name] += p.weight.grad.detach() ** 2
+                current_layer.zero_grad(set_to_none=True)
+
+            score_dict = {}
+            for name, p in subset.items():
+                avg_sq_grad = torch.sqrt(sq_grad[name] / args.nsamples)
+                act_tensor = torch.stack(activation_cache[name]).to(dev)
+                norm_term = act_tensor.norm(p=2, dim=(0, 1))
+                
+                # 根据权重形状智能广播
+                if norm_term.numel() == p.weight.shape[1]:
+                    # norm 对输入维度求得，与列数一致
+                    norm_broadcast = norm_term.unsqueeze(0)  # shape (1, in_dim)
+                elif norm_term.numel() == p.weight.shape[0]:
+                    # 与行数一致
+                    norm_broadcast = norm_term.unsqueeze(1)  # shape (out_dim,1)
+                else:
+                    # 退化到对标量广播，取 L2 范数均值
+                    norm_broadcast = norm_term.mean().view(1, 1)
+
+                score = p.weight.data.abs() * (WANDA_PP_ALPHA * avg_sq_grad + norm_broadcast)
+                score_dict[name] = score
+            
+            return score_dict
+
+        print(f"Layer {i}: Computing initial RGS score...")
+        initial_rgs_score = compute_rgs_score(layer)
+
+        print(f"Layer {i}: Starting Regional Optimization for {WANDA_PP_K} rounds...")
+        for k in range(WANDA_PP_K):
+            print(f"  RO round {k+1}/{WANDA_PP_K}")
+            layer_orig = deepcopy(layer).eval()
+            for p in layer_orig.parameters():
+                p.requires_grad = False
+            
+            ro_indices = random.sample(range(args.nsamples), WANDA_PP_RO_SAMPLES)
+
+            with torch.no_grad():
+                for name, p in subset.items():
+                    score = initial_rgs_score[name]
+                    k_to_prune = int(p.weight.numel() * args.sparsity_ratio)
+                    if k_to_prune == 0:
+                        W_mask = torch.zeros_like(score, dtype=torch.bool)
+                    elif k_to_prune >= score.numel():
+                        W_mask = torch.ones_like(score, dtype=torch.bool)
+                    else:
+                        flat_score = score.flatten()
+                        # 选取得分最低的 k 个索引
+                        _, low_idx = torch.topk(flat_score, k_to_prune, largest=False)
+                        mask_flat = torch.zeros_like(flat_score, dtype=torch.bool)
+                        mask_flat[low_idx] = True
+                        W_mask = mask_flat.view_as(score)
+                    p.weight.data.masked_fill_(W_mask, 0.0)
+
+            layer.train()
+            optimizer = torch.optim.AdamW(layer.parameters(), lr=WANDA_PP_LR)
+            
+            for j in ro_indices:
+                optimizer.zero_grad()
+                inp_j = inps[j].to(dev)
+                
+                with torch.no_grad():
+                    y_teacher = _get_layer_output(layer_orig, inp_j, att_mask_dev, pos_ids_dev, rotary_emb)
+                
+                y_student = _get_layer_output(layer, inp_j, att_mask_dev, pos_ids_dev, rotary_emb)
+                
+                loss = F.mse_loss(y_student, y_teacher)
+                loss.backward()
+                optimizer.step()
+
+            del layer_orig
+            torch.cuda.empty_cache()
+
+        print(f"Layer {i}: Computing final score and pruning...")
+        layer.eval()
+        final_score = compute_rgs_score(layer)
+
+        with torch.no_grad():
+            for name, p in subset.items():
+                score = final_score[name]
+                k_to_prune = int(p.weight.numel() * args.sparsity_ratio)
+                if k_to_prune == 0:
+                    W_mask = torch.zeros_like(score, dtype=torch.bool)
+                elif k_to_prune >= score.numel():
+                    W_mask = torch.ones_like(score, dtype=torch.bool)
+                else:
+                    flat_score = score.flatten()
+                    # 选取得分最低的 k 个索引
+                    _, low_idx = torch.topk(flat_score, k_to_prune, largest=False)
+                    mask_flat = torch.zeros_like(flat_score, dtype=torch.bool)
+                    mask_flat[low_idx] = True
+                    W_mask = mask_flat.view_as(score)
+                
+                p.weight.data.masked_fill_(W_mask, 0.0)
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = _get_layer_output(layer, inps[j], att_mask_dev, pos_ids_dev, rotary_emb)
+        
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache 
+    torch.cuda.empty_cache()

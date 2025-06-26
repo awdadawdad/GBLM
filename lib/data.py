@@ -26,6 +26,15 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
 
+    # Clip test sequence to avoid positions beyond model's max rotary embedding size
+    max_test_tokens = seqlen * 128  # e.g., 128 segments of length seqlen
+    testenc_ids = testenc.input_ids[:, :max_test_tokens]
+
+    # Wrap into TokenizerWrapper for compatibility
+    testenc = TokenizerWrapper(testenc_ids)
+
+    # NOTE: Downstream eval_ppl expects .input_ids attribute
+
     # Generate samples from training set
     random.seed(seed)
     trainloader = []
@@ -82,3 +91,7 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
         return get_wikitext2(nsamples, seed, seqlen, tokenizer)
     if "c4" in name:
         return get_c4(nsamples, seed, seqlen, tokenizer)
+    
+    # 如果没有匹配的数据集，返回默认值防止 None
+    print(f"Warning: Unknown dataset name '{name}', falling back to wikitext2")
+    return get_wikitext2(nsamples, seed, seqlen, tokenizer)
