@@ -50,8 +50,8 @@ def main():
     # Arguments for Wanda++
     parser.add_argument('--alpha', type=float, default=0.5, help='Alpha for RGS score in Wanda++.')
     parser.add_argument('--k_rounds', type=int, default=5, help='Number of regional optimization rounds in Wanda++.')
-    parser.add_argument('--ro_samples', type=int, default=2, help='Number of samples for regional optimization in Wanda++.')
-    parser.add_argument('--lr', type=float, default=3e-7, help='Learning rate for regional optimization in Wanda++.')
+    # parser.add_argument('--ro_samples', type=int, default=2, help='Number of samples for regional optimization in Wanda++.')
+    # parser.add_argument('--lr', type=float, default=3e-7, help='Learning rate for regional optimization in Wanda++.')
 
     args = parser.parse_args()
     print(f"Working on model: {args.model}")
@@ -87,7 +87,7 @@ def main():
         elif args.prune_method == "gblm":
             prune_gblm(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "wanda_pp":
-            wanda_pp(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
+            wanda_pp(args, model, tokenizer, device, args.alpha, args.k_rounds)
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "gradient":

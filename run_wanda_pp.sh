@@ -6,6 +6,4 @@ python main.py \
     --seed 0 \
     --alpha 0.4 \
     --k_rounds 10 \
-    --ro_samples 4 \
-    --lr 1e-6 \
     --save out/Llama-3.2-1B-Instruct/unstructured/wanda_pp/
