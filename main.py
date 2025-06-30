@@ -20,7 +20,7 @@ def get_llm(model, cache_dir="llm_weights"):
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
-        device_map="cuda:0"
+        device_map="cuda:1"
     )
     print("printing gpu allocation for all the layers")
     print(model.hf_device_map)
@@ -73,7 +73,7 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:1")
     if "30b" in args.model or "65b" in args.model or "70b" in args.model: 
         device = model.hf_device_map["lm_head"]
     print("use device ", device)
@@ -87,7 +87,7 @@ def main():
         elif args.prune_method == "gblm":
             prune_gblm(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "wanda_pp":
-            wanda_pp(args, model, tokenizer, device, args.alpha, args.k_rounds)
+            model =wanda_pp(args, model, tokenizer, device, args.alpha, args.k_rounds)
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "gradient":

@@ -110,6 +110,8 @@ def check_sparsity(model, args):
         print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
 
     model.config.use_cache = use_cache 
+    print(f"total zero params {count}")
+    print(f"total params {total_params}")
     return float(count)/total_params 
 
 def prepare_calibration_input(model, dataloader, nsamples, device):
@@ -118,7 +120,7 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
     layers = model.model.layers
 
     # 强制使用传入的 device（cuda:0），忽略 hf_device_map
-    device = torch.device("cuda:0")
+    device = device
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
@@ -152,7 +154,11 @@ def prepare_calibration_input(model, dataloader, nsamples, device):
 
 def _get_layer_output(layer, inputs, attention_mask, position_ids, rotary_emb):
     """Helper function to get layer output that gracefully handles missing masks/ids."""
-    hidden_states = inputs.unsqueeze(0)
+    # 输入可能已经带有 batch 维度 (B, L, D)。如果只有 (L, D)，则补一个 batch 维度。
+    if inputs.dim() == 2:
+        hidden_states = inputs.unsqueeze(0)
+    else:
+        hidden_states = inputs
 
     if (position_ids is not None) and (rotary_emb is not None):
         cos, sin = rotary_emb(hidden_states, position_ids=position_ids)
@@ -199,12 +205,15 @@ def get_each_transformer_layer_input(model, dataloader, nsamples, device):
     # 现在 activation_cache 里就有了所有层的输入激活值
     # 打印结果来验证
     for layer_idx, activations in activation_cache.items():
+        pass  # 保留占位，防止空代码块导致 IndentationError
+        # 可以根据需要取消下面的注释来打印调试信息
         # print(f"Layer {layer_idx}:")
-        # # activations 是一个列表，包含了 nsamples 个张量
         # print(f"  - Captured {len(activations)} activation tensors.")
-        # # 打印第一个捕获到的张量的形状
         # print(f"  - Shape of first activation tensor: {activations[0].shape}")
-
+    for key, acts in activation_cache.items():
+        shapes = {tuple(a.shape[-1:]) for a in acts}
+        if len(shapes) > 1:
+            print('冲突层:', key, '捕获到的维度集合:', shapes)
     return activation_cache
 
 
@@ -294,7 +303,7 @@ def prune_gblm(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0,
         subset = find_layers(layer)
 
         # 强制所有操作在 cuda:0 上进行
-        dev = torch.device("cuda:0")
+        dev = device
         # 将 inps/outs 转移到目标设备
         inps = inps.to(dev)
         outs = outs.to(dev)
@@ -385,10 +394,10 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
     print("loading calibdation data")
     dataloader, testenc = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
-    print("#"*20)
-    print(dataloader[0][0].size(1))
-    print("#"*20)
-    get_each_transformer_layer_input(model, dataloader, args.nsamples, torch.device("cuda:0"))
+    # print("#"*20)
+    # print(dataloader[0][0].size(1))
+    # print("#"*20)
+    get_each_transformer_layer_input(model, dataloader, args.nsamples, device)
     for name, block in model.named_modules():
         layer_name = '.'.join(name.split('.')[:3])
         print(layer_name)
@@ -543,7 +552,6 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0, layer_no=
     model.config.use_cache = True 
     print('Done.')
 
-# def wanda_pp(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0, layer_no=-1):
 activation_cache = {}
 def register_input_hooks(block: nn.Module):
     """
@@ -564,11 +572,14 @@ def get_signal(name: str):
     """
     return activation_cache.get(name, [])
 
-def compute_rgs_score(block, inps, alpha, attention_mask, position_ids, rotary_emb):
+def compute_rgs_score(block, inps, alpha, attention_mask, position_ids, rotary_emb, count):
+    # print("block: ", block)
     sq_grad = {name: torch.zeros_like(param) for name, param in block.named_parameters()}
 
     activation_cache.clear()
-    register_input_hooks(block)  
+    register_input_hooks(block)
+
+    
 
     for inp in inps:
         device = next(block.parameters()).device
@@ -581,6 +592,7 @@ def compute_rgs_score(block, inps, alpha, attention_mask, position_ids, rotary_e
             output = block(inp, attention_mask=attention_mask, position_embeddings=position_embeddings)[0]
         else:
             output = block(inp, attention_mask=attention_mask)[0]
+        
         loss = torch.norm(output)
 
         loss.backward(retain_graph=True)
@@ -590,24 +602,36 @@ def compute_rgs_score(block, inps, alpha, attention_mask, position_ids, rotary_e
                 if param.grad is not None:
                     sq_grad[name] += param.grad.detach() ** 2
         block.zero_grad()
+    # DEBUG: 打印钩子捕获的键名（前 10 个）
+    # 方便确认 activation_cache 的键与参数名是否对齐
+    #print("[DEBUG] activation_cache keys (first 10):", list(activation_cache.keys()))
 
     inps_len = len(inps)
+    if(count == 0):
+        print("inps_len: ", inps_len)
     for key in sq_grad:
         sq_grad[key] = torch.sqrt(sq_grad[key] / inps_len)
 
     score_dict = {}
-
+    # print("block: ", block)
     for name, param in block.named_parameters():
+        # print("#" * 20)
+        # if(name == "model.layers.0.self_attn.q_proj.weight"):
+        # print(f"name: {name}")
+        # print("#" * 20)
         cache_name = name.rsplit(".", 1)[0]
         if param.requires_grad and name.endswith('weight') and cache_name in activation_cache:
-            
+            # print("activation_cache[cache_name]: ",activation_cache[cache_name])
             layer_inps = torch.stack(get_signal(cache_name))
-            norm_term = layer_inps.norm(p=2, dim=[0,1])
+            norm_term = layer_inps.norm(p=2, dim=tuple(range(layer_inps.ndim - 1)))  # shape: [in_features]
             norm_term = norm_term.unsqueeze(0)
             score = param.data.abs() * (alpha * sq_grad[name] + norm_term) # 论文核心算法
             # 把权重的剪枝打分保存起来，后续用于排序和剪枝
+            #if(count == 0):
+                # print("param.data: ", param.data)
+                #print("param.data.abs(): ", param.data.abs())
             score_dict[name] = score
-
+    # print(f"rgs_score size for this block: {score_dict}")
     return score_dict
 
 def wanda_pp(args, model, tokenizer, device, alpha, K):
@@ -620,18 +644,22 @@ def wanda_pp(args, model, tokenizer, device, alpha, K):
     Returns:
         pruned model
     """
+    count = 0
+    # print("param.data: ", param.data)
+    # print("param.data.abs(): ", param.data.abs())
     dataloader, testenc = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
     print("dataset loading complete")
-    input_sets = get_each_transformer_layer_input(model, dataloader, args.nsamples, torch.device("cuda:0"))
+    input_sets = get_each_transformer_layer_input(model, dataloader, args.nsamples, device)
     
     # Get other necessary arguments for the forward pass
-    _, _, attention_mask, position_ids = prepare_calibration_input(model, dataloader, 1, torch.device("cuda:0"))
+    _, _, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
     rotary_emb = model.model.rotary_emb
     dev = next(model.parameters()).device
     attention_mask = attention_mask.to(dev) if attention_mask is not None else None
     position_ids = position_ids.to(dev) if position_ids is not None else None
 
     for name, block in model.named_modules():
+        
         # Only apply to top-level transformer layers
         if not name.startswith("model.layers.") or len(name.split('.')) > 3:
             continue
@@ -640,25 +668,37 @@ def wanda_pp(args, model, tokenizer, device, alpha, K):
         if layer_name not in input_sets:
             continue
 
-        X_l = input_sets[layer_name] 
-        rgs_score = compute_rgs_score(block, X_l, alpha, attention_mask, position_ids, rotary_emb)
-        
-        for k in range(K):
-            # 复制未剪枝的 block 作为 teacher（冻结参数）
-            block_orig = deepcopy(block)
-            # Step 2: 随机选择一些样本，比如32条
-            X_hat_l = random.sample(X_l, min(len(X_l), 32))  
+        X_l = input_sets[layer_name]
+        # --- 统一到 FP32 ，避免 FP16 溢出产生 NaN ---
+        block = block.float()
+        X_l   = [x.float() for x in X_l]
 
+        # for name, param in block.named_parameters(): 
+        #     # print("name: ", name)
+        #     # print("param.data: ", param.data)
+        #     # print("param.data.abs(): ", param.data.abs())
+            # print("#" * 20)
+        rgs_score = compute_rgs_score(block, X_l, alpha, attention_mask, position_ids, rotary_emb, count)
+        block_orig = deepcopy(block)
+        for k in range(K):
+            
+            # teacher 使用冻结的 FP32 权重
+            # block_orig = deepcopy(block)
+            # Step 2: 随机选择一些样本，比如32条
+            X_hat_l = random.sample(X_l, min(len(X_l), 32))
+
+            
             # Step 3: Pruning by RGS
             for name, param in block.named_parameters():
                 if name in rgs_score:
                     # Prune lowest X% scores (e.g. 30%)
-                    score = rgs_score[name]
+                    score = rgs_score[name].float()  # 确保使用 FP32 计算阈值
                     threshold = torch.quantile(score, 0.3)
                     mask = (score > threshold).float()
                     #print("param.data.shape: ", param.data.shape)
                     param.data *= mask  # Zero out pruned weights
-
+                    
+            
             # Step 4: Regional Optimization (fine-tune with small batch)            
             block_orig.eval()
             for p in block_orig.parameters():
@@ -673,21 +713,26 @@ def wanda_pp(args, model, tokenizer, device, alpha, K):
                 
                 device = next(block.parameters()).device
                 x_m = x_m.to(device)
+                # 通过 _get_layer_output 保证传入 position_embeddings
                 with torch.no_grad():
-                    y_teacher = block_orig(x_m)
-                y_student = block(x_m)
+                    y_teacher = _get_layer_output(block_orig, x_m, attention_mask, position_ids, rotary_emb)
+                y_student = _get_layer_output(block, x_m, attention_mask, position_ids, rotary_emb)
                 loss = torch.nn.functional.mse_loss(y_student, y_teacher)
                 loss.backward()
                 optimizer.step() 
-
+        
+            for n, p in block.named_parameters():
+                if torch.isnan(p).any():
+                    print("kkkkkkkkkkkkkkkkkkkkkkkkk = ", k)
+                    print("NaN in param -->", n)# 复制未剪枝的 block 作为 teacher（冻结参数）
         # Final pruning after RO
-        final_score = compute_rgs_score(block, X_l, alpha, attention_mask, position_ids, rotary_emb)
+        final_score = compute_rgs_score(block, X_l, alpha, attention_mask, position_ids, rotary_emb, count)
         #print("final_score: ",final_score)
         for name, param in block.named_parameters():
             if name in final_score:
-                score = final_score[name]
+                score = final_score[name].float()
                 threshold = torch.quantile(score, 0.3)
                 mask = (score > threshold).float()
                 param.data *= mask
-
+        count += 1
     return model
