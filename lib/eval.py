@@ -7,7 +7,7 @@ import torch.nn as nn
 from .data import get_loaders 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
+def eval_ppl(model, tokenizer, device):
     # Set dataset
     dataset = "wikitext2"
 

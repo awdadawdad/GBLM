@@ -87,7 +87,9 @@ def main():
         elif args.prune_method == "gblm":
             prune_gblm(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "wanda_pp":
-            model =wanda_pp(args, model, tokenizer, device, args.alpha, args.k_rounds)
+            model = wanda_pp(args, model, tokenizer, device, alpha=args.alpha, K=args.k_rounds, prune_n=prune_n, prune_m=prune_m)
+            import gc
+            gc.collect(); torch.cuda.empty_cache()
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m, layer_no=idx)
         elif args.prune_method == "gradient":
