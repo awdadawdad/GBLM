@@ -20,7 +20,7 @@ def get_llm(model, cache_dir="llm_weights"):
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
-        device_map="cuda:1"
+        device_map="cuda:5"
     )
     print("printing gpu allocation for all the layers")
     print(model.hf_device_map)
@@ -73,7 +73,7 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    device = torch.device("cuda:1")
+    device = torch.device("cuda:5")
     if "30b" in args.model or "65b" in args.model or "70b" in args.model: 
         device = model.hf_device_map["lm_head"]
     print("use device ", device)

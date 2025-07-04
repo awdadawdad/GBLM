@@ -189,9 +189,8 @@ def get_each_transformer_layer_input(model, dataloader, nsamples, device):
 
     # 3. 执行前向传播来触发所有钩子
     # 我们这里只处理 nsamples 个样本
-    nsamples = 128 #paper写的
     for i, batch in enumerate(dataloader):
-        if i >= nsamples:
+        if (nsamples is not None) and (nsamples > 0) and (i >= nsamples):
             break
         try:
             model(batch[0].to(device))
@@ -555,7 +554,8 @@ def register_input_hooks(block: nn.Module):
     """Register forward hooks for all Linear layers in *block* and return the handles so they can be removed later."""
     handles = []
     for name, submodule in block.named_modules():
-        if isinstance(submodule, nn.Linear):
+        if isinstance(submodule, nn.Linear): # 仅关注非 down_proj 的 Linear 层
+        # if isinstance(submodule, nn.Linear) and ("down_proj" not in name):
             def hook_fn(mod, inp, out, module_name=name):
                 if module_name not in activation_cache:
                     activation_cache[module_name] = []
@@ -616,7 +616,10 @@ def compute_rgs_score(block, inps, alpha, attention_mask, position_ids, rotary_e
         # print(f"name: {name}")
         # print("#" * 20)
         cache_name = name.rsplit(".", 1)[0]
-        if param.requires_grad and name.endswith('weight') and cache_name in activation_cache:
+        if (param.requires_grad
+            and name.endswith('weight')
+            # and ('down_proj' not in name)  # 跳过 down_proj
+            and cache_name in activation_cache):
             # print("activation_cache[cache_name]: ",activation_cache[cache_name])
             layer_inps = torch.stack(get_signal(cache_name))
             norm_term = layer_inps.norm(p=2, dim=tuple(range(layer_inps.ndim - 1)))  # shape: [in_features]
@@ -652,7 +655,8 @@ def wanda_pp(args, model, tokenizer, device, alpha, K, prune_n=0, prune_m=0):
     dataloader, testenc = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=2048,tokenizer=tokenizer)
     print("dataset loading complete")
     input_sets = get_each_transformer_layer_input(model, dataloader, args.nsamples, device)
-    
+    print("input_sets: ", input_sets.keys())
+    exit()
     # Get other necessary arguments for the forward pass
     _, _, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
     rotary_emb = model.model.rotary_emb
