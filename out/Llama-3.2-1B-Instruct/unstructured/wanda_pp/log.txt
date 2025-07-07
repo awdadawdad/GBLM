@@ -1,2 +1,2 @@
 actual_sparsity	ppl
-0.5000	inf
+0.5000	22.4155

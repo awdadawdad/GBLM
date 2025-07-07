@@ -575,7 +575,7 @@ def compute_rgs_score(block, inps, alpha, attention_mask, position_ids, rotary_e
 
     handles = register_input_hooks(block)
 
-    
+
 
     for inp in inps:
         device = next(block.parameters()).device
@@ -656,7 +656,7 @@ def wanda_pp(args, model, tokenizer, device, alpha, K, prune_n=0, prune_m=0):
     print("dataset loading complete")
     input_sets = get_each_transformer_layer_input(model, dataloader, args.nsamples, device)
     print("input_sets: ", input_sets.keys())
-    exit()
+    
     # Get other necessary arguments for the forward pass
     _, _, attention_mask, position_ids = prepare_calibration_input(model, dataloader, args.nsamples, device)
     rotary_emb = model.model.rotary_emb
